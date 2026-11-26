@@ -4,7 +4,11 @@ use adaptive_aead::envelope::{
 };
 use adaptive_aead::profile::RuntimeProfile;
 use adaptive_aead::selector::{AdaptiveSelector, SelectionPolicy, SwitchReason};
+use adaptive_aead::workload::{
+    TraceKind, TraceStep, build_mixed_burst_trace, build_policy_shift_trace, run_evaluation,
+};
 use adaptive_aead::{AeadCipher, Algorithm, CryptoError, KeyRing, NonceGenerator, SecurityPolicy};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn envelope_roundtrip_all_algorithms() {
@@ -176,4 +180,53 @@ fn static_policy_rejects_ineligible_security_constraint() {
         sel.select_for(1024, &sec_256),
         Err(CryptoError::PolicyViolation("security strength below minimum"))
     );
+}
+
+#[test]
+fn evaluator_runs_mini_trace_and_respects_policy_shift() {
+    let mixed = build_mixed_burst_trace();
+    let shifted = build_policy_shift_trace();
+    assert_eq!(mixed.len(), 120);
+    assert_eq!(shifted.len(), 90);
+
+    let sec_128 = SecurityPolicy::default();
+    let sec_256 = SecurityPolicy {
+        min_security_bits: 256,
+        ..SecurityPolicy::default()
+    };
+    let mini_trace: Vec<TraceStep> = (0..12)
+        .map(|i| TraceStep {
+            step: i,
+            size_bytes: if i % 2 == 0 { 256 } else { 16 * 1024 },
+            policy: if (4..8).contains(&i) { sec_256 } else { sec_128 },
+        })
+        .collect();
+
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let tmp = std::env::temp_dir().join(format!("adaptive_aead_test_{stamp}"));
+    let (summaries, timeline) =
+        run_evaluation("test", &[(TraceKind::PolicyShift, mini_trace)], &tmp).unwrap();
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    assert_eq!(summaries.len(), 9);
+    assert!(!timeline.is_empty());
+
+    let static_aes = summaries
+        .iter()
+        .find(|s| s.policy_label == "Static(AES-128-GCM)")
+        .unwrap();
+    assert!(!static_aes.policy_compliant);
+    assert_eq!(static_aes.policy_violations, 4);
+
+    let adaptive_zero = summaries
+        .iter()
+        .find(|s| s.policy_label == "Adaptive(d=0.00)")
+        .unwrap();
+    let adaptive_max_hyst = summaries
+        .iter()
+        .find(|s| s.policy_label == "Adaptive+Hyst(d=0.35)")
+        .unwrap();
+    assert!(adaptive_zero.policy_compliant);
+    assert!(adaptive_max_hyst.policy_compliant);
+    assert!(adaptive_max_hyst.switch_count <= adaptive_zero.switch_count);
 }

@@ -151,7 +151,8 @@ fn reason_str(reason: SwitchReason) -> &'static str {
     }
 }
 
-/// Deterministic 120-step mixed-size burst trace for the Memory domain.
+/// Deterministic 720-step (6x) mixed-size burst trace for the Memory domain,
+/// extending runtime into the ~85-100 ms regime on native hardware to suppress OS scheduling jitter.
 pub fn build_mixed_burst_trace() -> Vec<TraceStep> {
     let policy = SecurityPolicy::default();
     let pattern: &[usize] = &[
@@ -159,7 +160,7 @@ pub fn build_mixed_burst_trace() -> Vec<TraceStep> {
         128, 320, 4096, 16 * 1024, 64 * 1024, 128, 256, 512, 2048, 8192,
         256 * 1024, 1024 * 1024, 64, 512, 1024, 4096, 65_536, 256, 512, 4 * 1024 * 1024,
     ];
-    (0..120)
+    (0..720)
         .map(|step| TraceStep {
             step,
             file_count: 1,
@@ -169,8 +170,8 @@ pub fn build_mixed_burst_trace() -> Vec<TraceStep> {
         .collect()
 }
 
-/// Deterministic 90-step trace (`128 -> 256 -> 128 bit`) placing a Tiny item at step 29
-/// so step 30 genuinely exercises `SecurityOverride` across all hysteresis thresholds.
+/// Deterministic 720-step (8x) trace (`128 -> 256 -> 128 bit`, 240 steps per phase) placing a Tiny item
+/// at step 239 so step 240 genuinely exercises `SecurityOverride` across all hysteresis thresholds.
 pub fn build_policy_shift_trace() -> Vec<TraceStep> {
     let sec_128 = SecurityPolicy::default();
     let sec_256 = SecurityPolicy {
@@ -178,9 +179,9 @@ pub fn build_policy_shift_trace() -> Vec<TraceStep> {
         ..SecurityPolicy::default()
     };
     let sizes: &[usize] = &[128, 512, 4096, 16 * 1024, 64 * 1024, 512 * 1024, 256, 1024, 32 * 1024];
-    (0..90)
+    (0..720)
         .map(|step| {
-            let size = if step == 29 {
+            let size = if step == 239 {
                 128
             } else {
                 sizes[step % sizes.len()]
@@ -189,7 +190,7 @@ pub fn build_policy_shift_trace() -> Vec<TraceStep> {
                 step,
                 file_count: 1,
                 file_size_bytes: size,
-                policy: if (30..60).contains(&step) { sec_256 } else { sec_128 },
+                policy: if (240..480).contains(&step) { sec_256 } else { sec_128 },
             }
         })
         .collect()
@@ -359,6 +360,7 @@ pub fn execute_single_policy(
 
     let mut enc_total_ns = 0u64;
     let mut dec_total_ns = 0u64;
+    let mut enc_switch_total_ns = 0u64;
     let mut switch_total_ns = 0u64;
     let mut switch_count = 0usize;
     let mut policy_violations = 0usize;
@@ -388,7 +390,6 @@ pub fn execute_single_policy(
         }
 
         let (cipher, enc_sw_ns) = enc_cache.prepare(chosen)?;
-        switch_total_ns += enc_sw_ns;
         let mut nonce = vec![0u8; chosen.nonce_len()];
         let step_enc_ns: u64;
         let step_dec_ns: u64;
@@ -453,7 +454,11 @@ pub fn execute_single_policy(
             }
         }
 
-        let step_sw_ns = enc_sw_ns.max(dec_sw_ns);
+        // Report total transition overhead across both enc_cache and dec_cache,
+        // while keeping dec_sw_ns out of st_total/policy_total_ns since it is already inside step_dec_ns.
+        let step_sw_ns = enc_sw_ns + dec_sw_ns;
+        enc_switch_total_ns += enc_sw_ns;
+        switch_total_ns += step_sw_ns;
         enc_total_ns += step_enc_ns;
         dec_total_ns += step_dec_ns;
 
@@ -486,7 +491,7 @@ pub fn execute_single_policy(
         let _ = fs::remove_dir_all(out_dir);
     }
 
-    let policy_total_ns = enc_total_ns + dec_total_ns + switch_total_ns;
+    let policy_total_ns = enc_total_ns + dec_total_ns + enc_switch_total_ns;
     let total_sec = policy_total_ns as f64 / 1e9;
     let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
     let throughput_mb_s = if total_sec > 0.0 { total_mb / total_sec } else { 0.0 };

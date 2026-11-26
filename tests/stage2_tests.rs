@@ -181,10 +181,10 @@ fn security_policy_upgrade_overrides_hysteresis_and_picks_fastest_256bit() {
 fn worker_execution_and_trial_aggregation_handle_non_compliant_regret_as_none() {
     let mixed = build_mixed_burst_trace();
     let shifted = build_policy_shift_trace();
-    assert_eq!(mixed.len(), 120);
-    assert_eq!(shifted.len(), 90);
-    assert_eq!(shifted[29].file_size_bytes, 128);
-    assert_eq!(shifted[30].policy.min_security_bits, 256);
+    assert_eq!(mixed.len(), 720);
+    assert_eq!(shifted.len(), 720);
+    assert_eq!(shifted[239].file_size_bytes, 128);
+    assert_eq!(shifted[240].policy.min_security_bits, 256);
 
     let sec_128 = SecurityPolicy::default();
     let sec_256 = SecurityPolicy {

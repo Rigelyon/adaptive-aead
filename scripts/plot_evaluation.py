@@ -126,7 +126,7 @@ def plot_policy_comparison(
     soft_rows: list[dict[str, str]],
     out_stem: Path,
 ) -> None:
-    """Plot Memory Policy-Shift and Disk-Batch Throughput Comparison with IQR error bars."""
+    """Plot Native and Soft Memory Policy-Shift and Disk-Batch Throughput Comparison with IQR error bars."""
     selected = [
         ("Static(AES-128-GCM)", "Static\nAES-128"),
         ("Static(AES-256-GCM)", "Static\nAES-256"),
@@ -138,13 +138,17 @@ def plot_policy_comparison(
     ]
     colors = ["#888888", "#666666", "#777777", "#999999", "#D55E00", "#0072B2", "#009E73"]
 
-    fig, (ax_mem_soft, ax_disk_soft) = plt.subplots(1, 2, figsize=(12.6, 4.7), layout="constrained")
+    fig, axes = plt.subplots(2, 2, figsize=(13.2, 8.2), layout="constrained")
     x = np.arange(len(selected))
 
-    for ax, title, rows, domain, trace in [
-        (ax_mem_soft, "A. Memory Policy-Shift (Soft Profile, 128→256→128 bit)", soft_rows, "memory", "policy_shift"),
-        (ax_disk_soft, "B. Disk-Batch Mixed-Burst (Soft Profile)", soft_rows, "disk_batch", "mixed_burst"),
-    ]:
+    panels = [
+        (axes[0, 0], "A. Native — Memory Policy-Shift (128→256→128 bit)", native_rows, "memory", "policy_shift"),
+        (axes[0, 1], "B. Native — Disk-Batch Mixed-Burst", native_rows, "disk_batch", "mixed_burst"),
+        (axes[1, 0], "C. Soft — Memory Policy-Shift (128→256→128 bit)", soft_rows, "memory", "policy_shift"),
+        (axes[1, 1], "D. Soft — Disk-Batch Mixed-Burst", soft_rows, "disk_batch", "mixed_burst"),
+    ]
+
+    for ax, title, rows, domain, trace in panels:
         sub = {r["policy"]: r for r in rows if r["domain"] == domain and r["trace"] == trace}
         vals = [float(sub[k]["throughput_median_mb_s"]) for k, _ in selected]
         iqrs = [float(sub[k]["throughput_iqr_mb_s"]) / 2.0 for k, _ in selected]
@@ -157,7 +161,7 @@ def plot_policy_comparison(
             tag = f"{v:.1f}" + ("\n(NC)" if not ok else "")
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
-                v + max(vals) * 0.04,
+                v + max(vals) * 0.045,
                 tag,
                 ha="center",
                 va="bottom",
@@ -167,20 +171,23 @@ def plot_policy_comparison(
             )
 
         ax.set_title(title)
-        ax.set_ylabel("Median End-to-End Throughput (MB/s ± IQR/2)")
+        ax.set_ylabel("Median Throughput (MB/s ± IQR/2)")
         ax.set_xticks(x, [lbl for _, lbl in selected])
-        ax.set_ylim(0, max(vals) * 1.28 if vals else 1.0)
+        ax.set_ylim(0, max(vals) * 1.30 if vals else 1.0)
         ax.grid(axis="y", linestyle=":", lw=0.7, color="#CCCCCC")
 
-    _ = native_rows  # Kept for symmetric signature
-    fig.suptitle("Compliant Throughput Comparison Across Static, Lookup, and Adaptive Policies (n=11 Trials; NC = Non-Compliant)", fontsize=11.0, fontweight="bold")
+    fig.suptitle(
+        "Compliant Throughput Comparison Across Native & Software Profiles (n=11 Trials; NC = Non-Compliant)",
+        fontsize=11.5,
+        fontweight="bold",
+    )
     save_figure(fig, out_stem)
     plt.close(fig)
 
 
 def plot_selection_timeline(soft_tl: list[dict[str, str]], out_stem: Path) -> None:
-    """Plot per-step selection timeline on Memory Policy-Shift showing real SecurityOverride at step 30."""
-    fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(11.8, 5.6), sharex=True, layout="constrained")
+    """Plot per-step selection timeline on Memory Policy-Shift showing real SecurityOverride at step 240."""
+    fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(12.2, 5.6), sharex=True, layout="constrained")
 
     for ax, pol, title in [
         (ax0, "Lookup(d=0.00)", "A. Static Lookup without Hysteresis (δ = 0%) — Soft Profile (Memory)"),
@@ -192,17 +199,17 @@ def plot_selection_timeline(soft_tl: list[dict[str, str]], out_stem: Path) -> No
         ov_steps = [int(r["step"]) for r in rows if r["reason"] == "security_override"]
         ov_algs = [ALG_MAP[r["chosen_alg"]] for r in rows if r["reason"] == "security_override"]
 
-        ax.axvspan(30, 59, color="#F0E442", alpha=0.25, label="256-bit Security Phase (Steps 30–59)")
-        ax.step(steps, algs, where="post", color="#0072B2", lw=1.8, label="Active Cipher")
+        ax.axvspan(240, 479, color="#F0E442", alpha=0.25, label="256-bit Security Phase (Steps 240–479)")
+        ax.step(steps, algs, where="post", color="#0072B2", lw=1.6, label="Active Cipher")
         if ov_steps:
-            ax.scatter(ov_steps, ov_algs, color="#D55E00", s=55, zorder=5, label="SecurityOverride (Step 30)")
+            ax.scatter(ov_steps, ov_algs, color="#D55E00", s=55, zorder=5, label=f"SecurityOverride (Step {ov_steps[0]})")
         ax.set_yticks([0, 1, 2, 3], ["AES-128-GCM", "AES-256-GCM", "ChaCha20-Poly1305", "Ascon-AEAD128"])
         ax.set_ylim(-0.4, 3.4)
         ax.set_title(title)
         ax.grid(axis="x", linestyle=":", lw=0.6, color="#CCCCCC")
         ax.legend(loc="lower right")
 
-    ax1.set_xlabel("Trace Step Index (0–89)")
+    ax1.set_xlabel("Trace Step Index (0–719)")
     fig.suptitle("Algorithm Selection & SecurityOverride Timeline (Memory Policy-Shift Trace)", fontsize=11.5, fontweight="bold")
     save_figure(fig, out_stem)
     plt.close(fig)

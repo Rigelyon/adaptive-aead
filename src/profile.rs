@@ -300,10 +300,19 @@ impl RuntimeProfile {
         self.models[bucket.idx()][alg.index()].predicted_ns(size_bytes)
     }
 
-    /// Updates the EMA scaling factor for `(bucket(size_bytes), alg)` using a domain-matched observation.
+    /// Updates the EMA scaling factor for `(bucket(size_bytes), alg)` using a domain-matched observation,
+    /// while gently decaying unobserved algorithms in the same bucket back toward `1.0` to avoid stale-arm lock-in.
     pub fn observe(&mut self, alg: Algorithm, size_bytes: usize, observed_ns: f64) {
+        const UNOBSERVED_DECAY: f64 = 0.05;
         let bucket = WorkloadBucket::from_size(size_bytes);
-        self.models[bucket.idx()][alg.index()].observe(size_bytes, observed_ns, self.alpha);
+        let row = &mut self.models[bucket.idx()];
+        let chosen_idx = alg.index();
+        row[chosen_idx].observe(size_bytes, observed_ns, self.alpha);
+        for (idx, cost) in row.iter_mut().enumerate() {
+            if idx != chosen_idx {
+                cost.ema_scale = (1.0 - UNOBSERVED_DECAY) * cost.ema_scale + UNOBSERVED_DECAY * 1.0;
+            }
+        }
     }
 
     pub fn serialize(&self) -> String {
@@ -404,5 +413,21 @@ mod tests {
         let p = RuntimeProfile::from_models(0.2, models);
         let decoded = RuntimeProfile::deserialize(&p.serialize()).unwrap();
         assert!((decoded.predicted_ns(Algorithm::AsconAead128, 64) - p.predicted_ns(Algorithm::AsconAead128, 64)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unobserved_arms_decay_toward_unit_scale() {
+        let mut models = [[AffineCost {
+            intercept_ns: 100.0,
+            slope_ns_per_byte: 1.0,
+            ema_scale: 1.0,
+        }; 4]; 5];
+        models[0][Algorithm::Aes128Gcm.index()].ema_scale = 2.0;
+        let mut p = RuntimeProfile::from_models(0.2, models);
+
+        // Observing Ascon decays stale AES-128 scale smoothly toward 1.0
+        p.observe(Algorithm::AsconAead128, 256, 356.0);
+        let decayed = p.model(WorkloadBucket::Tiny, Algorithm::Aes128Gcm).ema_scale;
+        assert!((decayed - 1.95).abs() < 1e-9);
     }
 }

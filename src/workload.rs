@@ -149,49 +149,6 @@ fn io_err(_: std::io::Error) -> CryptoError {
     CryptoError::AeadFailure
 }
 
-fn measure_oracle_steps(
-    keys: &KeyRing,
-    steps: &[TraceStep],
-    input_paths: &[std::path::PathBuf],
-    out_dir: &Path,
-) -> Result<Vec<u64>, CryptoError> {
-    let mut nonces = NonceGenerator::new();
-    let mut oracle_ns = Vec::with_capacity(steps.len());
-
-    for (idx, step) in steps.iter().enumerate() {
-        let eligible = step.policy.eligible_algorithms();
-        let mut best_ns = u64::MAX;
-
-        for alg in eligible {
-            let cipher = AeadCipher::new(alg, keys.key_for(alg))?;
-            let mut nonce = vec![0u8; alg.nonce_len()];
-            nonces.next_into(&mut nonce);
-
-            let in_path = &input_paths[idx];
-            let enc_path = out_dir.join(format!("oracle_{idx:04}_{}.aead", alg.id()));
-            let mut buf = Vec::with_capacity(step.size_bytes + 64);
-
-            let t0 = Instant::now();
-            File::open(in_path).map_err(io_err)?.read_to_end(&mut buf).map_err(io_err)?;
-            seal_envelope(&cipher, &nonce, b"trace-aad", &mut buf)?;
-            File::create(&enc_path).map_err(io_err)?.write_all(&buf).map_err(io_err)?;
-
-            buf.clear();
-            File::open(&enc_path).map_err(io_err)?.read_to_end(&mut buf).map_err(io_err)?;
-            open_envelope(keys, &step.policy, b"trace-aad", &mut buf)?;
-            let elapsed = t0.elapsed().as_nanos() as u64;
-            let _ = fs::remove_file(&enc_path);
-
-            if elapsed < best_ns {
-                best_ns = elapsed;
-            }
-        }
-        oracle_ns.push(best_ns);
-    }
-
-    Ok(oracle_ns)
-}
-
 fn evaluated_policies() -> Vec<SelectionPolicy> {
     vec![
         SelectionPolicy::Static(Algorithm::Aes128Gcm),
@@ -204,6 +161,27 @@ fn evaluated_policies() -> Vec<SelectionPolicy> {
         SelectionPolicy::AdaptiveHysteresis { delta: 0.25 },
         SelectionPolicy::AdaptiveHysteresis { delta: 0.35 },
     ]
+}
+
+fn warmup_disk_io(in_dir: &Path, out_dir: &Path, keys: &KeyRing, first_input: &Path) -> Result<(), CryptoError> {
+    let _ = in_dir;
+    let cipher = AeadCipher::new(Algorithm::Aes128Gcm, keys.key_for(Algorithm::Aes128Gcm))?;
+    let mut nonce = vec![0u8; Algorithm::Aes128Gcm.nonce_len()];
+    let mut nonces = NonceGenerator::new();
+    let warm_path = out_dir.join("warmup.aead");
+    let mut buf = Vec::new();
+    for _ in 0..3 {
+        nonces.next_into(&mut nonce);
+        buf.clear();
+        File::open(first_input).map_err(io_err)?.read_to_end(&mut buf).map_err(io_err)?;
+        seal_envelope(&cipher, &nonce, b"trace-aad", &mut buf)?;
+        File::create(&warm_path).map_err(io_err)?.write_all(&buf).map_err(io_err)?;
+        buf.clear();
+        File::open(&warm_path).map_err(io_err)?.read_to_end(&mut buf).map_err(io_err)?;
+        open_envelope(keys, &SecurityPolicy::default(), b"trace-aad", &mut buf)?;
+    }
+    let _ = fs::remove_file(&warm_path);
+    Ok(())
 }
 
 /// Runs full disk-backed trace evaluations across all 9 policies and returns metrics + timeline.
@@ -241,8 +219,14 @@ pub fn run_evaluation(
             input_paths.push(p);
         }
 
-        let oracle_steps = measure_oracle_steps(&keys, steps, &input_paths, &out_dir)?;
-        let oracle_total_ns: u64 = oracle_steps.iter().sum();
+        if let Some(first) = input_paths.first() {
+            warmup_disk_io(&in_dir, &out_dir, &keys, first)?;
+        }
+
+        // Virtual Best Solver (Oracle) per step across eligible Static baselines
+        let mut vbs_step_ns = vec![u64::MAX; steps.len()];
+        let trace_summary_start = summaries.len();
+        let trace_tl_start = timeline.len();
 
         for policy in &policies {
             let mut selector = AdaptiveSelector::new(*policy, calibrated.clone());
@@ -302,6 +286,13 @@ pub fn run_evaluation(
                 dec_total_ns += dec_ns;
                 let _ = fs::remove_file(&enc_path);
 
+                if matches!(policy, SelectionPolicy::Static(_)) && step.policy.validate(chosen).is_ok() {
+                    let step_total = enc_ns + dec_ns;
+                    if step_total < vbs_step_ns[idx] {
+                        vbs_step_ns[idx] = step_total;
+                    }
+                }
+
                 selector.observe(chosen, step.size_bytes, (enc_ns + dec_ns) as f64);
 
                 timeline.push(TimelineRecord {
@@ -317,7 +308,7 @@ pub fn run_evaluation(
                     enc_ns,
                     dec_ns,
                     switch_ns,
-                    oracle_ns: oracle_steps[idx],
+                    oracle_ns: 0,
                 });
             }
 
@@ -325,12 +316,6 @@ pub fn run_evaluation(
             let total_sec = policy_total_ns as f64 / 1e9;
             let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
             let throughput_mb_s = if total_sec > 0.0 { total_mb / total_sec } else { 0.0 };
-            let regret_ns = policy_total_ns as f64 - oracle_total_ns as f64;
-            let regret_pct = if oracle_total_ns > 0 {
-                (regret_ns / oracle_total_ns as f64) * 100.0
-            } else {
-                0.0
-            };
 
             summaries.push(PolicyEvalSummary {
                 profile_mode: profile_label.to_string(),
@@ -343,11 +328,26 @@ pub fn run_evaluation(
                 peak_rss_kib: read_peak_rss_kib(),
                 switch_count,
                 switch_overhead_ms: switch_total_ns as f64 / 1e6,
-                regret_ms: regret_ns / 1e6,
-                regret_pct,
+                regret_ms: policy_total_ns as f64 / 1e6,
+                regret_pct: 0.0,
                 policy_compliant: policy_violations == 0,
                 policy_violations,
             });
+        }
+
+        let oracle_total_ns: u64 = vbs_step_ns.iter().copied().filter(|&v| v < u64::MAX).sum();
+        for s in &mut summaries[trace_summary_start..] {
+            let policy_total_ns = (s.enc_total_ms + s.dec_total_ms + s.switch_overhead_ms) * 1e6;
+            let regret_ns = policy_total_ns - oracle_total_ns as f64;
+            s.regret_ms = regret_ns / 1e6;
+            s.regret_pct = if oracle_total_ns > 0 {
+                (regret_ns / oracle_total_ns as f64) * 100.0
+            } else {
+                0.0
+            };
+        }
+        for rec in &mut timeline[trace_tl_start..] {
+            rec.oracle_ns = vbs_step_ns[rec.step];
         }
 
         let _ = fs::remove_dir_all(&trace_dir);

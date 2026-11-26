@@ -268,7 +268,9 @@ pub fn run_evaluation(
 
                 let t_enc = Instant::now();
                 File::open(&input_paths[idx]).map_err(io_err)?.read_to_end(&mut buf).map_err(io_err)?;
+                let t_c_enc = Instant::now();
                 seal_envelope(cipher, &nonce, b"trace-aad", &mut buf)?;
+                let c_enc_ns = t_c_enc.elapsed().as_nanos() as u64;
                 File::create(&enc_path).map_err(io_err)?.write_all(&buf).map_err(io_err)?;
                 let enc_ns = t_enc.elapsed().as_nanos() as u64;
                 enc_total_ns += enc_ns;
@@ -281,7 +283,9 @@ pub fn run_evaluation(
                 } else {
                     step.policy
                 };
+                let t_c_dec = Instant::now();
                 open_envelope(&keys, &verify_policy, b"trace-aad", &mut buf)?;
+                let c_dec_ns = t_c_dec.elapsed().as_nanos() as u64;
                 let dec_ns = t_dec.elapsed().as_nanos() as u64;
                 dec_total_ns += dec_ns;
                 let _ = fs::remove_file(&enc_path);
@@ -293,7 +297,7 @@ pub fn run_evaluation(
                     }
                 }
 
-                selector.observe(chosen, step.size_bytes, (enc_ns + dec_ns) as f64);
+                selector.observe(chosen, step.size_bytes, (c_enc_ns + c_dec_ns) as f64);
 
                 timeline.push(TimelineRecord {
                     profile_mode: profile_label.to_string(),

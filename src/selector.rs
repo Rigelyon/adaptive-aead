@@ -1,4 +1,4 @@
-//! Security-constrained adaptive AEAD selector with relative hysteresis.
+//! Security-constrained adaptive AEAD selector with static-lookup vs online-EMA and hysteresis.
 
 use crate::crypto::{Algorithm, CryptoError, SecurityPolicy};
 use crate::profile::RuntimeProfile;
@@ -7,24 +7,69 @@ use crate::profile::RuntimeProfile;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SelectionPolicy {
     Static(Algorithm),
-    Adaptive,
-    AdaptiveHysteresis { delta: f64 },
+    Lookup,
+    LookupHysteresis { delta: f64 },
+    AdaptiveEma,
+    AdaptiveEmaHysteresis { delta: f64 },
 }
 
 impl SelectionPolicy {
     pub fn label(&self) -> String {
         match self {
             Self::Static(alg) => format!("Static({})", alg.name()),
-            Self::Adaptive => "Adaptive(d=0.00)".to_string(),
-            Self::AdaptiveHysteresis { delta } => format!("Adaptive+Hyst(d={delta:.2})"),
+            Self::Lookup => "Lookup(d=0.00)".to_string(),
+            Self::LookupHysteresis { delta } => format!("Lookup+Hyst(d={delta:.2})"),
+            Self::AdaptiveEma => "AdaptiveEMA(d=0.00)".to_string(),
+            Self::AdaptiveEmaHysteresis { delta } => format!("AdaptiveEMA+Hyst(d={delta:.2})"),
+        }
+    }
+
+    pub fn key(&self) -> String {
+        match self {
+            Self::Static(alg) => format!("static:{}", alg.id()),
+            Self::Lookup => "lookup:0.00".to_string(),
+            Self::LookupHysteresis { delta } => format!("lookup:{delta:.2}"),
+            Self::AdaptiveEma => "ema:0.00".to_string(),
+            Self::AdaptiveEmaHysteresis { delta } => format!("ema:{delta:.2}"),
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        let (kind, val) = key.split_once(':')?;
+        match kind {
+            "static" => {
+                let id: u8 = val.parse().ok()?;
+                Some(Self::Static(Algorithm::from_id(id).ok()?))
+            }
+            "lookup" => {
+                let d: f64 = val.parse().ok()?;
+                if d <= 0.0 {
+                    Some(Self::Lookup)
+                } else {
+                    Some(Self::LookupHysteresis { delta: d })
+                }
+            }
+            "ema" => {
+                let d: f64 = val.parse().ok()?;
+                if d <= 0.0 {
+                    Some(Self::AdaptiveEma)
+                } else {
+                    Some(Self::AdaptiveEmaHysteresis { delta: d })
+                }
+            }
+            _ => None,
         }
     }
 
     pub const fn delta(&self) -> f64 {
         match self {
-            Self::Static(_) | Self::Adaptive => 0.0,
-            Self::AdaptiveHysteresis { delta } => *delta,
+            Self::Static(_) | Self::Lookup | Self::AdaptiveEma => 0.0,
+            Self::LookupHysteresis { delta } | Self::AdaptiveEmaHysteresis { delta } => *delta,
         }
+    }
+
+    pub const fn uses_ema(&self) -> bool {
+        matches!(self, Self::AdaptiveEma | Self::AdaptiveEmaHysteresis { .. })
     }
 }
 
@@ -73,7 +118,7 @@ impl AdaptiveSelector {
         self.policy
     }
 
-    /// Selects the algorithm for an upcoming file of `size_bytes` under `security`.
+    /// Selects the algorithm for an upcoming file/batch item of `size_bytes` under `security`.
     pub fn select_for(
         &mut self,
         size_bytes: usize,
@@ -158,8 +203,10 @@ impl AdaptiveSelector {
         }
     }
 
-    /// Feeds real observed latency back into the online EMA profile.
+    /// Updates online EMA telemetry only if the policy uses online EMA feedback.
     pub fn observe(&mut self, alg: Algorithm, size_bytes: usize, observed_ns: f64) {
-        self.profile.observe(alg, size_bytes, observed_ns);
+        if self.policy.uses_ema() {
+            self.profile.observe(alg, size_bytes, observed_ns);
+        }
     }
 }

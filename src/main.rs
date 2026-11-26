@@ -1,11 +1,13 @@
 //! Pilot benchmark profiling AES-128-GCM, ChaCha20-Poly1305, and Ascon-AEAD128
 //! across initialization overhead, in-memory payload sizes, and disk file batches.
 
+use adaptive_aead::profile::RuntimeProfile;
+use adaptive_aead::selector::SelectionPolicy;
 use adaptive_aead::workload::{
-    TraceKind, build_mixed_burst_trace, build_policy_shift_trace, run_evaluation,
-    write_evaluation_csvs,
+    DEFAULT_TRIALS, TraceKind, WorkloadDomain, build_trace, execute_single_policy,
+    run_isolated_evaluation, serialize_worker_result, write_evaluation_csvs,
 };
-use adaptive_aead::{AeadCipher, Algorithm, NonceGenerator, SecurityPolicy};
+use adaptive_aead::{AeadCipher, Algorithm, KeyRing, NonceGenerator, SecurityPolicy};
 use std::fs::{self, File};
 use std::hint::black_box;
 use std::io::{Read, Write};
@@ -156,14 +158,8 @@ fn bench_in_memory(alg: Algorithm, size_bytes: usize, trials: usize, reps_per_tr
 }
 
 struct FileBenchResult {
-    scenario: &'static str,
-    alg: Algorithm,
-    file_count: usize,
-    file_size_bytes: usize,
     enc_total_ms: f64,
     dec_total_ms: f64,
-    enc_mb_s: f64,
-    dec_mb_s: f64,
 }
 
 fn prepare_test_files(dir: &Path, count: usize, file_size: usize) -> std::io::Result<Vec<PathBuf>> {
@@ -183,7 +179,7 @@ fn prepare_test_files(dir: &Path, count: usize, file_size: usize) -> std::io::Re
 }
 
 fn bench_disk_scenario(
-    scenario: &'static str,
+    _scenario: &'static str,
     alg: Algorithm,
     input_paths: &[PathBuf],
     out_dir: &Path,
@@ -227,19 +223,9 @@ fn bench_disk_scenario(
     }
     let dec_total_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
 
-    let total_mb = (input_paths.len() * file_size_bytes) as f64 / (1024.0 * 1024.0);
-    let enc_mb_s = total_mb / (enc_total_ms / 1000.0);
-    let dec_mb_s = total_mb / (dec_total_ms / 1000.0);
-
     Ok(FileBenchResult {
-        scenario,
-        alg,
-        file_count: input_paths.len(),
-        file_size_bytes,
         enc_total_ms,
         dec_total_ms,
-        enc_mb_s,
-        dec_mb_s,
     })
 }
 
@@ -324,7 +310,7 @@ fn run_pilot_cli() -> std::io::Result<()> {
         }
     }
 
-    // 3. Disk file I/O + AEAD benchmark
+    // 3. Disk file I/O + AEAD benchmark (1 warmup + 5 rotated trials, median reported)
     let tmp_root = PathBuf::from("bench_tmp");
     let disk_scenarios: &[(&'static str, usize, usize)] = &[
         ("batch_small_200x4KB", 200, 4 * 1024),
@@ -332,7 +318,7 @@ fn run_pilot_cli() -> std::io::Result<()> {
         ("large_1x64MB", 1, 64 * 1024 * 1024),
     ];
 
-    println!("\n[3] Disk File Processing Benchmark (Read -> AEAD -> Write):");
+    println!("\n[3] Disk File Processing Benchmark (Median of 5 Rotated Trials, Read -> AEAD -> Write):");
     println!(
         "{:<22} | {:<18} | {:>11} | {:>11} | {:>11} | {:>11}",
         "Scenario", "Algorithm", "Enc (ms)", "Dec (ms)", "Enc (MB/s)", "Dec (MB/s)"
@@ -343,30 +329,57 @@ fn run_pilot_cli() -> std::io::Result<()> {
     for &(name, count, fsize) in disk_scenarios {
         let in_dir = tmp_root.join(format!("{name}_in"));
         let inputs = prepare_test_files(&in_dir, count, fsize)?;
-        for &alg in &candidates {
-            let out_dir = tmp_root.join(format!("{name}_out_{}", alg.name()));
-            let r = bench_disk_scenario(name, alg, &inputs, &out_dir, fsize)?;
+
+        // Warmup pass on first algorithm so OS page cache is hot before timed trials
+        if let Some(&first_alg) = candidates.first() {
+            let warm_dir = tmp_root.join(format!("{name}_warm"));
+            let _ = bench_disk_scenario(name, first_alg, &inputs, &warm_dir, fsize)?;
+            let _ = fs::remove_dir_all(&warm_dir);
+        }
+
+        let num_trials = 5usize;
+        let mut enc_by_alg: Vec<Vec<f64>> = vec![Vec::with_capacity(num_trials); candidates.len()];
+        let mut dec_by_alg: Vec<Vec<f64>> = vec![Vec::with_capacity(num_trials); candidates.len()];
+
+        for trial in 0..num_trials {
+            for offset in 0..candidates.len() {
+                let alg_idx = (trial + offset) % candidates.len();
+                let alg = candidates[alg_idx];
+                let out_dir = tmp_root.join(format!("{name}_out_{}_{trial}", alg.name()));
+                let r = bench_disk_scenario(name, alg, &inputs, &out_dir, fsize)?;
+                enc_by_alg[alg_idx].push(r.enc_total_ms);
+                dec_by_alg[alg_idx].push(r.dec_total_ms);
+                let _ = fs::remove_dir_all(&out_dir);
+            }
+        }
+
+        let total_mb = (count * fsize) as f64 / (1024.0 * 1024.0);
+        for (alg_idx, &alg) in candidates.iter().enumerate() {
+            let enc_med = median_f64(&mut enc_by_alg[alg_idx]);
+            let dec_med = median_f64(&mut dec_by_alg[alg_idx]);
+            let enc_mb_s = total_mb / (enc_med / 1000.0);
+            let dec_mb_s = total_mb / (dec_med / 1000.0);
             println!(
                 "{:<22} | {:<18} | {:>11.2} | {:>11.2} | {:>11.2} | {:>11.2}",
-                r.scenario, r.alg.name(), r.enc_total_ms, r.dec_total_ms, r.enc_mb_s, r.dec_mb_s
+                name, alg.name(), enc_med, dec_med, enc_mb_s, dec_mb_s
             );
             disk_csv_rows.push(format!(
                 "disk_{},{},{},{},{:.2},{:.2},{:.2},{:.2}",
-                r.scenario,
-                r.alg.name(),
-                r.file_size_bytes,
-                r.file_count,
-                r.enc_total_ms * 1e6,
-                r.dec_total_ms * 1e6,
-                r.enc_mb_s,
-                r.dec_mb_s
+                name,
+                alg.name(),
+                fsize,
+                count,
+                enc_med * 1e6,
+                dec_med * 1e6,
+                enc_mb_s,
+                dec_mb_s
             ));
-            let _ = fs::remove_dir_all(&out_dir);
         }
         let _ = fs::remove_dir_all(&in_dir);
     }
     let _ = fs::remove_dir_all(&tmp_root);
 
+    let _ = KeyRing::deterministic_benchmark();
     let (rss_kib, hwm_kib) = read_proc_memory_kib();
     println!(
         "\nProcess Memory: VmRSS={:?} KiB, Peak VmHWM={:?} KiB",
@@ -387,33 +400,79 @@ fn run_pilot_cli() -> std::io::Result<()> {
     Ok(())
 }
 
-fn run_evaluate_cli(profile: &str) -> std::io::Result<()> {
-    let traces = vec![
-        (TraceKind::MixedBurst, build_mixed_burst_trace()),
-        (TraceKind::PolicyShift, build_policy_shift_trace()),
-    ];
+fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|w| w[0] == flag)
+        .map(|w| w[1].as_str())
+}
+
+fn run_eval_worker_cli(args: &[String]) -> std::io::Result<()> {
+    let domain_name = arg_value(args, "--domain").ok_or_else(|| std::io::Error::other("missing --domain"))?;
+    let domain = WorkloadDomain::from_name(domain_name)
+        .ok_or_else(|| std::io::Error::other("invalid --domain"))?;
+    let profile_mode = arg_value(args, "--profile").unwrap_or("native");
+    let trace_name = arg_value(args, "--trace").ok_or_else(|| std::io::Error::other("missing --trace"))?;
+    let trace_kind = TraceKind::from_name(trace_name)
+        .ok_or_else(|| std::io::Error::other("invalid --trace"))?;
+    let pol_key = arg_value(args, "--policy").ok_or_else(|| std::io::Error::other("missing --policy"))?;
+    let policy = SelectionPolicy::from_key(pol_key)
+        .ok_or_else(|| std::io::Error::other("invalid --policy"))?;
+    let trial: usize = arg_value(args, "--trial")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let cal_path = arg_value(args, "--profile-cache")
+        .ok_or_else(|| std::io::Error::other("missing --profile-cache"))?;
+    let out_path = arg_value(args, "--out").ok_or_else(|| std::io::Error::other("missing --out"))?;
+    let disk_root = arg_value(args, "--disk-root").map(PathBuf::from);
+
+    let cal_txt = fs::read_to_string(cal_path)?;
+    let calibrated = RuntimeProfile::deserialize(&cal_txt)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let steps = build_trace(domain, trace_kind);
+    let res = execute_single_policy(
+        domain,
+        profile_mode,
+        trace_kind,
+        policy,
+        calibrated,
+        &steps,
+        trial,
+        disk_root.as_deref(),
+    )
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    fs::write(out_path, serialize_worker_result(&res))
+}
+
+fn run_evaluate_cli(profile: &str, trials: usize) -> std::io::Result<()> {
     let work_dir = PathBuf::from(format!("bench_eval_tmp_{profile}"));
-    let (summaries, timeline) = run_evaluation(profile, &traces, &work_dir)
+    let (summaries, timeline) = run_isolated_evaluation(profile, trials, &work_dir)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    println!("=== Adaptive AEAD Stage 2 Evaluation (profile={profile}) ===");
+    println!("=== Adaptive AEAD Stage 2 Evaluation (profile={profile}, trials={trials}, isolated subprocesses) ===");
     println!(
-        "{:<13} | {:<24} | {:>10} | {:>8} | {:>8} | {:>9} | {:>9}",
-        "Trace", "Policy", "Thru(MB/s)", "Switches", "SwOv(ms)", "Regret(%)", "Compliant"
+        "{:<10} | {:<12} | {:<27} | {:>10} | {:>7} | {:>7} | {:>8} | {:>9} | {:>9}",
+        "Domain", "Trace", "Policy", "Med(MB/s)", "IQR", "Sw(med)", "RSS(KiB)", "Regret(%)", "Compliant"
     );
     println!(
-        "{:-<13}-+-{:-<24}-+-{:-<10}-+-{:-<8}-+-{:-<8}-+-{:-<9}-+-{:-<9}",
-        "", "", "", "", "", "", ""
+        "{:-<10}-+-{:-<12}-+-{:-<27}-+-{:-<10}-+-{:-<7}-+-{:-<7}-+-{:-<8}-+-{:-<9}-+-{:-<9}",
+        "", "", "", "", "", "", "", "", ""
     );
     for s in &summaries {
+        let reg = match s.regret_median_pct {
+            Some(v) => format!("{v:.2}"),
+            None => "N/A".to_string(),
+        };
         println!(
-            "{:<13} | {:<24} | {:>10.2} | {:>8} | {:>8.3} | {:>9.2} | {:>9}",
+            "{:<10} | {:<12} | {:<27} | {:>10.2} | {:>7.2} | {:>7.1} | {:>8.0} | {:>9} | {:>9}",
+            s.domain,
             s.trace_name,
             s.policy_label,
-            s.throughput_mb_s,
-            s.switch_count,
-            s.switch_overhead_ms,
-            s.regret_pct,
+            s.throughput_median_mb_s,
+            s.throughput_iqr_mb_s,
+            s.switch_count_median,
+            s.peak_rss_median_kib,
+            reg,
             s.policy_compliant
         );
     }
@@ -429,13 +488,13 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("evaluate") => {
-            let profile = args
-                .windows(2)
-                .find(|w| w[0] == "--profile")
-                .map(|w| w[1].as_str())
-                .unwrap_or("native");
-            run_evaluate_cli(profile)
+            let profile = arg_value(&args, "--profile").unwrap_or("native");
+            let trials = arg_value(&args, "--trials")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_TRIALS);
+            run_evaluate_cli(profile, trials)
         }
+        Some("eval-worker") => run_eval_worker_cli(&args),
         _ => run_pilot_cli(),
     }
 }

@@ -1,6 +1,6 @@
 //! Self-describing encrypted file envelope with AAD-authenticated header binding.
 
-use crate::crypto::{AeadCipher, Algorithm, CryptoError, KeyRing, SecurityPolicy};
+use crate::crypto::{AeadCipher, Algorithm, CipherCache, CryptoError, KeyRing, SecurityPolicy};
 
 pub const ENVELOPE_MAGIC: [u8; 4] = *b"AAED";
 pub const ENVELOPE_VERSION: u8 = 1;
@@ -93,6 +93,27 @@ pub fn parse_header(data: &[u8]) -> Result<(EnvelopeHeader, usize), CryptoError>
     ))
 }
 
+/// Validates security policy, verifies header + payload authenticity using `CipherCache`, and decrypts in-place.
+/// Returns `(algorithm, switch_overhead_ns)`.
+pub fn open_envelope_cached(
+    cache: &mut CipherCache,
+    policy: &SecurityPolicy,
+    user_aad: &[u8],
+    buffer: &mut Vec<u8>,
+) -> Result<(Algorithm, u64), CryptoError> {
+    let (header, header_len) = parse_header(buffer)?;
+    policy.validate(header.alg)?;
+
+    let bound_aad = build_bound_aad(&buffer[..header_len], user_aad);
+    let ct_len = buffer.len() - header_len;
+    buffer.copy_within(header_len.., 0);
+    buffer.truncate(ct_len);
+
+    let (cipher, switch_ns) = cache.prepare(header.alg)?;
+    cipher.decrypt_in_place(&header.nonce, &bound_aad, buffer)?;
+    Ok((header.alg, switch_ns))
+}
+
 /// Validates security policy, verifies header + payload authenticity, and decrypts in-place.
 pub fn open_envelope(
     keys: &KeyRing,
@@ -100,16 +121,7 @@ pub fn open_envelope(
     user_aad: &[u8],
     buffer: &mut Vec<u8>,
 ) -> Result<Algorithm, CryptoError> {
-    let (header, header_len) = parse_header(buffer)?;
-    policy.validate(header.alg)?;
-
-    let bound_aad = build_bound_aad(&buffer[..header_len], user_aad);
-    let cipher = AeadCipher::new(header.alg, keys.key_for(header.alg))?;
-
-    let ct_len = buffer.len() - header_len;
-    buffer.copy_within(header_len.., 0);
-    buffer.truncate(ct_len);
-
-    cipher.decrypt_in_place(&header.nonce, &bound_aad, buffer)?;
-    Ok(header.alg)
+    let mut cache = CipherCache::new(keys);
+    let (alg, _) = open_envelope_cached(&mut cache, policy, user_aad, buffer)?;
+    Ok(alg)
 }

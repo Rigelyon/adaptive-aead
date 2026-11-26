@@ -1,4 +1,4 @@
-"""Generate publication-quality Stage 2 evaluation figures from eval_<profile>.csv."""
+"""Generate publication-quality Stage 2 evaluation figures from multi-trial isolated CSVs."""
 
 from __future__ import annotations
 
@@ -9,15 +9,18 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 
-PROFILE_STYLES = {
-    "native": {"color": "#0072B2", "marker": "o", "linestyle": "-", "label": "Native (AES-NI + AVX2)"},
-    "soft": {"color": "#D55E00", "marker": "s", "linestyle": "--", "label": "Software-Only (Scalar)"},
+SERIES_STYLES = {
+    ("native", "Lookup"): {"color": "#0072B2", "marker": "o", "linestyle": "-", "label": "Native — Static Lookup"},
+    ("native", "EMA"): {"color": "#56B4E9", "marker": "s", "linestyle": "--", "label": "Native — Online EMA"},
+    ("soft", "Lookup"): {"color": "#D55E00", "marker": "^", "linestyle": "-", "label": "Soft — Static Lookup"},
+    ("soft", "EMA"): {"color": "#009E73", "marker": "D", "linestyle": "--", "label": "Soft — Online EMA"},
 }
 
 ALG_MAP = {
     "AES-128-GCM": 0,
-    "ChaCha20-Poly1305": 1,
-    "Ascon-AEAD128": 2,
+    "AES-256-GCM": 1,
+    "ChaCha20-Poly1305": 2,
+    "Ascon-AEAD128": 3,
 }
 
 
@@ -35,7 +38,7 @@ def configure_rcparams() -> None:
             "axes.labelsize": 9.5,
             "xtick.labelsize": 8.5,
             "ytick.labelsize": 8.5,
-            "legend.fontsize": 8.5,
+            "legend.fontsize": 8.0,
             "legend.frameon": True,
             "legend.framealpha": 0.95,
             "legend.edgecolor": "#CCCCCC",
@@ -60,11 +63,15 @@ def save_figure(fig: mpl.figure.Figure, stem: Path) -> None:
     fig.savefig(stem.with_suffix(".pdf"), facecolor="white")
 
 
-def parse_delta(policy_label: str) -> float | None:
-    if policy_label == "Adaptive(d=0.00)":
-        return 0.0
-    if policy_label.startswith("Adaptive+Hyst(d="):
-        return float(policy_label.split("d=")[1].rstrip(")"))
+def parse_family_delta(policy_label: str) -> tuple[str, float] | None:
+    if policy_label == "Lookup(d=0.00)":
+        return ("Lookup", 0.0)
+    if policy_label.startswith("Lookup+Hyst(d="):
+        return ("Lookup", float(policy_label.split("d=")[1].rstrip(")")))
+    if policy_label == "AdaptiveEMA(d=0.00)":
+        return ("EMA", 0.0)
+    if policy_label.startswith("AdaptiveEMA+Hyst(d="):
+        return ("EMA", float(policy_label.split("d=")[1].rstrip(")")))
     return None
 
 
@@ -73,37 +80,43 @@ def plot_hysteresis_tradeoff(
     soft_rows: list[dict[str, str]],
     out_stem: Path,
 ) -> None:
-    fig, (ax_sw, ax_reg) = plt.subplots(1, 2, figsize=(11.5, 4.5), layout="constrained")
+    """Plot Switching Frequency & Performance Regret vs Hysteresis Threshold (Memory domain)."""
+    fig, (ax_sw, ax_reg) = plt.subplots(1, 2, figsize=(12.0, 4.7), layout="constrained")
 
     for profile, rows in [("native", native_rows), ("soft", soft_rows)]:
-        st = PROFILE_STYLES[profile]
-        mb = [r for r in rows if r["trace"] == "mixed_burst"]
-        pts = []
-        for r in mb:
-            d = parse_delta(r["policy"])
-            if d is not None:
-                pts.append((d * 100.0, int(r["switch_count"]), float(r["regret_pct"])))
-        pts.sort(key=lambda x: x[0])
-        xs = [p[0] for p in pts]
-        sw = [p[1] for p in pts]
-        reg = [p[2] for p in pts]
+        mb = [r for r in rows if r["domain"] == "memory" and r["trace"] == "mixed_burst"]
+        for family in ["Lookup", "EMA"]:
+            st = SERIES_STYLES[(profile, family)]
+            pts = []
+            for r in mb:
+                parsed = parse_family_delta(r["policy"])
+                if parsed and parsed[0] == family:
+                    d = parsed[1] * 100.0
+                    sw = float(r["switch_count_median"])
+                    reg = float(r["regret_median_pct"]) if r["regret_median_pct"] != "N/A" else np.nan
+                    pts.append((d, sw, reg))
+            pts.sort(key=lambda x: x[0])
+            xs = [p[0] for p in pts]
+            sw = [p[1] for p in pts]
+            reg = [p[2] for p in pts]
 
-        ax_sw.plot(xs, sw, label=st["label"], color=st["color"], marker=st["marker"], linestyle=st["linestyle"], lw=2.0)
-        ax_reg.plot(xs, reg, label=st["label"], color=st["color"], marker=st["marker"], linestyle=st["linestyle"], lw=2.0)
+            ax_sw.plot(xs, sw, label=st["label"], color=st["color"], marker=st["marker"], linestyle=st["linestyle"], lw=2.0)
+            ax_reg.plot(xs, reg, label=st["label"], color=st["color"], marker=st["marker"], linestyle=st["linestyle"], lw=2.0)
 
-    ax_sw.set_title("A. Switching Frequency vs Hysteresis Threshold")
+    ax_sw.set_title("A. Median Switching Frequency vs Hysteresis Threshold")
     ax_sw.set_xlabel("Hysteresis Threshold δ (%)")
-    ax_sw.set_ylabel("Algorithm Switches (count)")
+    ax_sw.set_ylabel("Algorithm Switches (median of 11 trials)")
     ax_sw.grid(axis="y", linestyle=":", lw=0.7, color="#CCCCCC")
     ax_sw.legend(loc="upper right")
 
-    ax_reg.set_title("B. Performance Regret vs Hysteresis Threshold")
+    ax_reg.axhline(0.0, color="#666666", linestyle=":", lw=1.0)
+    ax_reg.set_title("B. Median Performance Regret vs VBS Oracle")
     ax_reg.set_xlabel("Hysteresis Threshold δ (%)")
     ax_reg.set_ylabel("Performance Regret vs Oracle (%)")
     ax_reg.grid(axis="y", linestyle=":", lw=0.7, color="#CCCCCC")
     ax_reg.legend(loc="upper left")
 
-    fig.suptitle("Hysteresis Stability–Performance Trade-Off (Mixed Burst Trace)", fontsize=11.5, fontweight="bold")
+    fig.suptitle("Hysteresis Stability–Performance Trade-Off (Memory Domain, Mixed Burst, n=11 Trials)", fontsize=11.5, fontweight="bold")
     save_figure(fig, out_stem)
     plt.close(fig)
 
@@ -113,59 +126,84 @@ def plot_policy_comparison(
     soft_rows: list[dict[str, str]],
     out_stem: Path,
 ) -> None:
-    selected_policies = [
-        "Static(AES-128-GCM)",
-        "Static(ChaCha20-Poly1305)",
-        "Static(Ascon-AEAD128)",
-        "Adaptive(d=0.00)",
-        "Adaptive+Hyst(d=0.15)",
+    """Plot Memory Policy-Shift and Disk-Batch Throughput Comparison with IQR error bars."""
+    selected = [
+        ("Static(AES-128-GCM)", "Static\nAES-128"),
+        ("Static(AES-256-GCM)", "Static\nAES-256"),
+        ("Static(ChaCha20-Poly1305)", "Static\nChaCha20"),
+        ("Static(Ascon-AEAD128)", "Static\nAscon"),
+        ("Lookup(d=0.00)", "Lookup\n(δ=0%)"),
+        ("Lookup+Hyst(d=0.15)", "Lookup+Hyst\n(δ=15%)"),
+        ("AdaptiveEMA+Hyst(d=0.15)", "EMA+Hyst\n(δ=15%)"),
     ]
-    short_labels = ["Static\nAES-GCM", "Static\nChaCha20", "Static\nAscon", "Adaptive\n(δ=0%)", "Adaptive+Hyst\n(δ=15%)"]
+    colors = ["#888888", "#666666", "#777777", "#999999", "#D55E00", "#0072B2", "#009E73"]
 
-    fig, (ax_nat, ax_soft) = plt.subplots(1, 2, figsize=(12.0, 4.6), layout="constrained")
-    x = np.arange(len(selected_policies))
+    fig, (ax_mem_soft, ax_disk_soft) = plt.subplots(1, 2, figsize=(12.6, 4.7), layout="constrained")
+    x = np.arange(len(selected))
 
-    for ax, title, rows in [
-        (ax_nat, "A. Native Hardware Profile (AES-NI + AVX2)", native_rows),
-        (ax_soft, "B. Pure-Software Scalar Profile", soft_rows),
+    for ax, title, rows, domain, trace in [
+        (ax_mem_soft, "A. Memory Policy-Shift (Soft Profile, 128→256→128 bit)", soft_rows, "memory", "policy_shift"),
+        (ax_disk_soft, "B. Disk-Batch Mixed-Burst (Soft Profile)", soft_rows, "disk_batch", "mixed_burst"),
     ]:
-        mb = {r["policy"]: float(r["throughput_mb_s"]) for r in rows if r["trace"] == "mixed_burst"}
-        vals = [mb[p] for p in selected_policies]
-        colors = ["#666666", "#888888", "#AAAAAA", "#D55E00", "#0072B2"]
-        bars = ax.bar(x, vals, width=0.58, color=colors, edgecolor="#222222", lw=0.8)
-        ax.set_title(title)
-        ax.set_ylabel("End-to-End Throughput (MB/s)")
-        ax.set_xticks(x, short_labels)
-        ax.set_ylim(0, max(vals) * 1.22 if vals else 1.0)
-        ax.grid(axis="y", linestyle=":", lw=0.7, color="#CCCCCC")
-        for b, v in zip(bars, vals):
-            ax.text(b.get_x() + b.get_width() / 2.0, v + max(vals) * 0.02, f"{v:.1f}", ha="center", va="bottom", fontsize=8.0)
+        sub = {r["policy"]: r for r in rows if r["domain"] == domain and r["trace"] == trace}
+        vals = [float(sub[k]["throughput_median_mb_s"]) for k, _ in selected]
+        iqrs = [float(sub[k]["throughput_iqr_mb_s"]) / 2.0 for k, _ in selected]
+        compliant = [sub[k]["policy_compliant"] == "true" for k, _ in selected]
 
-    fig.suptitle("Policy Throughput Comparison on Mixed Burst Workload", fontsize=11.5, fontweight="bold")
+        bars = ax.bar(x, vals, yerr=iqrs, capsize=3, width=0.58, color=colors, edgecolor="#222222", lw=0.8)
+        for bar, v, ok in zip(bars, vals, compliant):
+            if not ok:
+                bar.set_hatch("//")
+            tag = f"{v:.1f}" + ("\n(NC)" if not ok else "")
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                v + max(vals) * 0.04,
+                tag,
+                ha="center",
+                va="bottom",
+                fontsize=7.3,
+                color="#B22222" if not ok else "#111111",
+                fontweight="bold" if not ok else "normal",
+            )
+
+        ax.set_title(title)
+        ax.set_ylabel("Median End-to-End Throughput (MB/s ± IQR/2)")
+        ax.set_xticks(x, [lbl for _, lbl in selected])
+        ax.set_ylim(0, max(vals) * 1.28 if vals else 1.0)
+        ax.grid(axis="y", linestyle=":", lw=0.7, color="#CCCCCC")
+
+    _ = native_rows  # Kept for symmetric signature
+    fig.suptitle("Compliant Throughput Comparison Across Static, Lookup, and Adaptive Policies (n=11 Trials; NC = Non-Compliant)", fontsize=11.0, fontweight="bold")
     save_figure(fig, out_stem)
     plt.close(fig)
 
 
 def plot_selection_timeline(soft_tl: list[dict[str, str]], out_stem: Path) -> None:
-    fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(11.5, 5.4), sharex=True, layout="constrained")
+    """Plot per-step selection timeline on Memory Policy-Shift showing real SecurityOverride at step 30."""
+    fig, (ax0, ax1) = plt.subplots(2, 1, figsize=(11.8, 5.6), sharex=True, layout="constrained")
 
     for ax, pol, title in [
-        (ax0, "Adaptive(d=0.00)", "A. Adaptive without Hysteresis (δ = 0%) — Software Profile"),
-        (ax1, "Adaptive+Hyst(d=0.15)", "B. Adaptive with Hysteresis (δ = 15%) — Software Profile"),
+        (ax0, "Lookup(d=0.00)", "A. Static Lookup without Hysteresis (δ = 0%) — Soft Profile (Memory)"),
+        (ax1, "Lookup+Hyst(d=0.15)", "B. Static Lookup with Hysteresis (δ = 15%) — Soft Profile (Memory)"),
     ]:
-        rows = [r for r in soft_tl if r["trace"] == "policy_shift" and r["policy"] == pol]
+        rows = [r for r in soft_tl if r["domain"] == "memory" and r["trace"] == "policy_shift" and r["policy"] == pol]
         steps = [int(r["step"]) for r in rows]
         algs = [ALG_MAP[r["chosen_alg"]] for r in rows]
-        ax.axvspan(30, 59, color="#F0E442", alpha=0.25, label="256-bit Security Phase")
-        ax.step(steps, algs, where="post", color="#0072B2", lw=1.8)
-        ax.set_yticks([0, 1, 2], ["AES-128-GCM", "ChaCha20-Poly1305", "Ascon-AEAD128"])
-        ax.set_ylim(-0.35, 2.35)
+        ov_steps = [int(r["step"]) for r in rows if r["reason"] == "security_override"]
+        ov_algs = [ALG_MAP[r["chosen_alg"]] for r in rows if r["reason"] == "security_override"]
+
+        ax.axvspan(30, 59, color="#F0E442", alpha=0.25, label="256-bit Security Phase (Steps 30–59)")
+        ax.step(steps, algs, where="post", color="#0072B2", lw=1.8, label="Active Cipher")
+        if ov_steps:
+            ax.scatter(ov_steps, ov_algs, color="#D55E00", s=55, zorder=5, label="SecurityOverride (Step 30)")
+        ax.set_yticks([0, 1, 2, 3], ["AES-128-GCM", "AES-256-GCM", "ChaCha20-Poly1305", "Ascon-AEAD128"])
+        ax.set_ylim(-0.4, 3.4)
         ax.set_title(title)
         ax.grid(axis="x", linestyle=":", lw=0.6, color="#CCCCCC")
         ax.legend(loc="lower right")
 
     ax1.set_xlabel("Trace Step Index (0–89)")
-    fig.suptitle("Per-Step Algorithm Selection & Security Override Timeline (Policy Shift Trace)", fontsize=11.5, fontweight="bold")
+    fig.suptitle("Algorithm Selection & SecurityOverride Timeline (Memory Policy-Shift Trace)", fontsize=11.5, fontweight="bold")
     save_figure(fig, out_stem)
     plt.close(fig)
 

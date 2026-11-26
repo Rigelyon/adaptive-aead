@@ -67,6 +67,22 @@ fn test_aes_128_gcm_nist_sp800_38d_kat() {
 }
 
 #[test]
+fn test_aes_256_gcm_nist_sp800_38d_kat() {
+    // NIST CAVS gcmEncryptExtIV256.rsp vector (32-byte PT and 48-byte AAD)
+    verify_kat(
+        Algorithm::Aes256Gcm,
+        "21bd5691f7af1ce765f099e3c5c09786936982834efd81dd5527c7c322f90e83",
+        "36a59e523df04bc7feb74944",
+        "48aef5872f67f524b54598781c3b28f9cbcf353066c3670370fca44e132761203100b5e6c7352a930f7e9cbf28a8e1ce",
+        "77e539dfdab4cfb9309a75c2ee9f9e9aa1b4651568b05390d73da19f12ccbe78",
+        concat!(
+            "c21483731f7fe1b8a17d6e133eda16db7d73ddd7e34b47eec2f99b3bbc9669aa",
+            "15f9265bc523298cefb20337f878b283"
+        ),
+    );
+}
+
+#[test]
 fn test_chacha20_poly1305_rfc8439_kat() {
     // RFC 8439 Section 2.8.2 test vector
     let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
@@ -114,15 +130,15 @@ fn test_ascon_aead128_nist_sp800_232_kats() {
 #[test]
 fn test_security_policy_filtering() {
     let policy_128 = SecurityPolicy::default();
-    assert_eq!(policy_128.eligible_algorithms().len(), 3);
+    assert_eq!(policy_128.eligible_algorithms().len(), 4);
 
-    // Requiring 256-bit key strength excludes 128-bit AEADs
+    // Requiring 256-bit key strength excludes 128-bit AEADs while preserving 256-bit candidates
     let policy_256 = SecurityPolicy {
         min_security_bits: 256,
         ..SecurityPolicy::default()
     };
     assert_eq!(
         policy_256.eligible_algorithms(),
-        vec![Algorithm::ChaCha20Poly1305]
+        vec![Algorithm::Aes256Gcm, Algorithm::ChaCha20Poly1305]
     );
 }

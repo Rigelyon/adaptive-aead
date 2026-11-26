@@ -4,6 +4,7 @@
 pub mod crypto;
 pub mod envelope;
 pub mod profile;
+pub mod selector;
 
 pub use crypto::{
     AeadCipher, Algorithm, CipherCache, CryptoError, KeyRing, NonceGenerator, SecurityPolicy,

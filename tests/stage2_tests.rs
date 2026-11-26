@@ -2,6 +2,8 @@ use adaptive_aead::envelope::{
     ENVELOPE_MAGIC, ENVELOPE_VERSION, FIXED_HEADER_LEN, open_envelope, parse_header,
     seal_envelope,
 };
+use adaptive_aead::profile::RuntimeProfile;
+use adaptive_aead::selector::{AdaptiveSelector, SelectionPolicy, SwitchReason};
 use adaptive_aead::{AeadCipher, Algorithm, CryptoError, KeyRing, NonceGenerator, SecurityPolicy};
 
 #[test]
@@ -95,5 +97,83 @@ fn envelope_rejects_header_tampering_and_policy_violation() {
     assert_eq!(
         open_envelope(&keys, &policy_128, b"wrong", &mut wrong_aad),
         Err(CryptoError::AeadFailure)
+    );
+}
+
+fn synthetic_profile() -> RuntimeProfile {
+    // Rates (ns/byte) per bucket [AES-128-GCM, ChaCha20-Poly1305, Ascon-AEAD128]
+    let rates = [
+        [3.0, 10.0, 2.0], // Tiny
+        [2.0, 2.2, 5.0],  // Small
+        [1.15, 1.0, 4.0], // Medium
+        [1.0, 1.2, 4.0],  // Large
+        [1.0, 1.2, 4.0],  // Bulk
+    ];
+    RuntimeProfile::from_rates(0.2, rates)
+}
+
+#[test]
+fn hysteresis_holds_below_delta_and_switches_above_delta() {
+    let sec = SecurityPolicy::default();
+
+    let mut sel = AdaptiveSelector::new(
+        SelectionPolicy::AdaptiveHysteresis { delta: 0.20 },
+        synthetic_profile(),
+    );
+
+    // 1. First file (Small, 4096 B) -> picks AES-128-GCM (2.0 vs 2.2)
+    let d1 = sel.select_for(4096, &sec).unwrap();
+    assert_eq!(d1.chosen, Algorithm::Aes128Gcm);
+    assert_eq!(d1.reason, SwitchReason::Initial);
+
+    // 2. Medium (65536 B): ChaCha20 is 1.0 vs AES 1.15 -> gain ≈ 0.1304 <= 0.20 -> HOLD
+    let d2 = sel.select_for(65_536, &sec).unwrap();
+    assert_eq!(d2.chosen, Algorithm::Aes128Gcm);
+    assert!(!d2.switched);
+    assert_eq!(d2.reason, SwitchReason::HysteresisHeld);
+
+    // 3. Tiny (256 B): Ascon is 2.0 vs AES 3.0 -> gain ≈ 0.3333 > 0.20 -> SWITCH
+    let d3 = sel.select_for(256, &sec).unwrap();
+    assert_eq!(d3.chosen, Algorithm::AsconAead128);
+    assert!(d3.switched);
+    assert_eq!(d3.reason, SwitchReason::ThresholdExceeded);
+}
+
+#[test]
+fn security_policy_upgrade_overrides_hysteresis_immediately() {
+    let sec_128 = SecurityPolicy::default();
+    let sec_256 = SecurityPolicy {
+        min_security_bits: 256,
+        ..SecurityPolicy::default()
+    };
+
+    let mut sel = AdaptiveSelector::new(
+        SelectionPolicy::AdaptiveHysteresis { delta: 0.95 },
+        synthetic_profile(),
+    );
+
+    let d1 = sel.select_for(256, &sec_128).unwrap();
+    assert_eq!(d1.chosen, Algorithm::AsconAead128);
+
+    // Policy tightens to 256-bit -> Ascon invalid -> must force switch to ChaCha20-Poly1305
+    let d2 = sel.select_for(256, &sec_256).unwrap();
+    assert_eq!(d2.chosen, Algorithm::ChaCha20Poly1305);
+    assert!(d2.switched);
+    assert_eq!(d2.reason, SwitchReason::SecurityOverride);
+}
+
+#[test]
+fn static_policy_rejects_ineligible_security_constraint() {
+    let sec_256 = SecurityPolicy {
+        min_security_bits: 256,
+        ..SecurityPolicy::default()
+    };
+    let mut sel = AdaptiveSelector::new(
+        SelectionPolicy::Static(Algorithm::Aes128Gcm),
+        synthetic_profile(),
+    );
+    assert_eq!(
+        sel.select_for(1024, &sec_256),
+        Err(CryptoError::PolicyViolation("security strength below minimum"))
     );
 }

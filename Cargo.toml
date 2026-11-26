@@ -1,0 +1,16 @@
+[package]
+name = "adaptive-aead"
+version = "0.1.0"
+edition = "2024"
+description = "Security-constrained workload-aware adaptive AEAD file processing with hysteresis"
+
+[dependencies]
+aead = "0.6.1"
+aes-gcm = "0.11.1"
+ascon-aead128 = "0.1.1"
+chacha20poly1305 = "0.11.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
